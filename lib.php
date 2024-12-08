@@ -403,7 +403,9 @@ class cachestore_mbsredis extends store implements
     public function initialise(definition $definition) {
         $this->definition = $definition;
         $this->hash = $definition->generate_definition_hash();
-        $this->prefix = 'mbsredis_' . $this->hash . '_';
+        // Start the prefix with something different than the hash itself to not mess them up with the ttl hKeys which have
+        // the pattern "$this->hash . self::TTL_SUFFIX". Could be problematic when doing a SCAN for example.
+        $this->prefix = 'cd_' . $this->hash . '_';
         return true;
     }
 
@@ -503,7 +505,7 @@ class cachestore_mbsredis extends store implements
         }
         if ($this->definition->get_ttl()) {
             // When TTL is enabled, we also store the key name in a list sorted by the current time.
-            $this->redis->zAdd($this->hash . self::TTL_SUFFIX, [], self::get_time(), $this->prefix . $key);
+            $this->redis->zAdd($this->hash . self::TTL_SUFFIX, [], self::get_time(), $key);
             // The return value to the zAdd function never indicates whether the operation succeeded
             // (it returns zero when there was no error if the item is already in the list) so we
             // ignore it.
@@ -540,7 +542,7 @@ class cachestore_mbsredis extends store implements
                 // When TTL is enabled, we also store the key names in a list sorted by the current
                 // time.
                 $ttlparams[] = $now;
-                $ttlparams[] = $key;
+                $ttlparams[] = $pair['key'];
             }
         }
         if ($usettl && count($ttlparams) > 0) {
@@ -565,12 +567,12 @@ class cachestore_mbsredis extends store implements
      */
     public function delete($key) {
         $ok = true;
-        if (!$this->redis->del($this->prefix . $key)) {
+        if (!$this->redis->unlink($this->prefix . $key)) {
             $ok = false;
         }
         if ($this->definition->get_ttl()) {
             // When TTL is enabled, also remove the key from the TTL list.
-            $this->redis->zRem($this->hash . self::TTL_SUFFIX, $this->prefix . $key);
+            $this->redis->zRem($this->hash . self::TTL_SUFFIX, $key);
         }
         return $ok;
     }
@@ -589,7 +591,7 @@ class cachestore_mbsredis extends store implements
         $count = $this->redis->unlink(array_map(fn($key) => $this->prefix . $key, $keys));
         if ($this->definition->get_ttl()) {
             // When TTL is enabled, also remove the keys from the TTL list.
-            $this->redis->zRem($this->hash . self::TTL_SUFFIX, ...array_map(fn($key) => $this->prefix . $key, $keys));
+            $this->redis->zRem($this->hash . self::TTL_SUFFIX, ...$keys);
         }
         return $count;
     }
@@ -602,7 +604,7 @@ class cachestore_mbsredis extends store implements
     public function purge() {
         if ($this->definition->get_ttl()) {
             // Purge the TTL list as well.
-            $this->redis->del($this->hash . self::TTL_SUFFIX);
+            $this->redis->unlink($this->hash . self::TTL_SUFFIX);
             // According to documentation, there is no error return for the 'del' command (it
             // only returns the number of keys deleted, which could be 0 or 1 in this case) so we
             // do not need to check the return value.
@@ -744,27 +746,27 @@ class cachestore_mbsredis extends store implements
      */
     public function find_by_prefix($prefix) {
         $return = [];
-        $prefix = $this->prefix . $prefix;
+        $completeprefix = $this->redisprefix . $this->prefix . $prefix;
 
-        $hosts = $this->clustermode ? $this->redis->_masters() : ['bla'];
+        $hosts = $this->clustermode ? $this->redis->_masters() : ['PLACEHOLDER TO TRIGGER THE FOREACH LOOP ONCE'];
 
         foreach ($hosts as $host) {
             $iterator = null;
             do {
                 if ($this->clustermode) {
-                    $keys = $this->redis->scan($iterator, $host, $this->redisprefix . $prefix . '*');
+                    $keys = $this->redis->scan($iterator, $host, $completeprefix . '*');
                 } else {
-                    $keys = $this->redis->scan($iterator, $this->redisprefix . $prefix . '*');
+                    $keys = $this->redis->scan($iterator, $completeprefix . '*');
                 }
 
                 if (!empty($keys)) {
-                    $return = $return +
-                            array_map(fn($key) => preg_replace('/^' . $this->redisprefix . $this->prefix . '/', '', $key), $keys);
+                    $return = array_merge($return, $keys);
                 }
             } while ($iterator > 0);
         }
 
-        return $return;
+        // The full key name is being returned, so we need to strip off the prefix(es) again.
+        return array_map(fn($key) => preg_replace('/^' . $this->redisprefix . $this->prefix . '/', '', $key), $return);
     }
 
     /**
@@ -778,7 +780,7 @@ class cachestore_mbsredis extends store implements
     public function release_lock($key, $ownerid) {
         if ($this->check_lock_state($key, $ownerid)) {
             unset($this->currentlocks[$key]);
-            return ($this->redis->del($key) !== false);
+            return ($this->redis->unlink($key) !== false);
         }
         return false;
     }
@@ -804,7 +806,7 @@ class cachestore_mbsredis extends store implements
         do {
             $keys = $this->redis->zRangeByScore($this->hash . self::TTL_SUFFIX, 0, $limit,
                     ['limit' => [0, self::TTL_EXPIRE_BATCH]]);
-            $this->delete_many(array_map(fn($key) => preg_replace('/^' . $this->prefix . '/', '', $key), $keys));
+            $this->delete_many(array_map(fn($key) => $this->prefix . $key, $keys));
             $count += count($keys);
             $batches++;
         } while (count($keys) === self::TTL_EXPIRE_BATCH);

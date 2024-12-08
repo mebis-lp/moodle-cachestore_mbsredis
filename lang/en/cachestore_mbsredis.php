@@ -36,7 +36,7 @@ $string['encrypt_connection'] = 'Use TLS encryption.';
 $string['encrypt_connection_help'] = 'Use TLS to connect to Redis. Do not use \'tls://\' in the hostname for Redis, use this option instead.';
 $string['password'] = 'Password';
 $string['password_help'] = 'This sets the password of the Redis server.';
-$string['pluginname'] = 'Redis';
+$string['pluginname'] = 'Mebis Redis';
 $string['prefix'] = 'Key prefix';
 $string['prefix_help'] = 'This prefix is used for all key names on the Redis server.
 * If you only have one Moodle instance using this server, you can leave this value default.
