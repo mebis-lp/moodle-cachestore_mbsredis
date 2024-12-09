@@ -42,12 +42,12 @@ final class ttl_test extends \advanced_testcase {
             $this->markTestSkipped('Could not test cachestore_mbsredis. Requirements are not met.');
         }
 
-        // Set up a Redis store with a fake definition that has TTL set to 10 seconds.
+        // Set up a Redis store with a fake definition that has TTL set to 1 second.
         $definition = definition::load('core/wibble', [
                 'mode' => 1,
                 'simplekeys' => true,
                 'simpledata' => true,
-                'ttl' => 10,
+                'ttl' => 1,
                 'component' => 'core',
                 'area' => 'wibble',
                 'selectedsharingoption' => 2,
@@ -83,42 +83,48 @@ final class ttl_test extends \advanced_testcase {
     public function test_expire_ttl(): void {
         $this->resetAfterTest();
 
-        // Set some data at time 100.
-        \cachestore_mbsredis::set_phpunit_time(100);
         $this->store->set('a', 1);
         $this->store->set('b', 2);
-        $this->store->set_many([['key' => 'c', 'value' => 3], ['key' => 'd', 'value' => 4],
-                ['key' => 'e', 'value' => 5], ['key' => 'f', 'value' => 6],
-                ['key' => 'g', 'value' => 7], ['key' => 'h', 'value' => 8]]);
 
-        // Set some other data at time 110, including some of the existing values. Whether the
-        // value changes or not, its TTL should update.
-        \cachestore_mbsredis::set_phpunit_time(110);
+        $this->store->set_many([['key' => 'c', 'value' => 3], ['key' => 'd', 'value' => 4]]);
+        $this->assertTrue($this->store->has('a'));
+        $this->assertTrue($this->store->has('b'));
+        $this->assertTrue($this->store->has('c'));
+        $this->assertTrue($this->store->has('d'));
+        // We set the TTL to 1 second. So if we wait 1 second here, all the keys should have expired.
+        sleep(2);
+        $this->assertFalse($this->store->has('a'));
+        $this->assertFalse($this->store->has('b'));
+        $this->assertFalse($this->store->has('c'));
+        $this->assertFalse($this->store->has('d'));
+
+        // Set up a Redis store with a fake definition that has TTL set to 10 seconds.
+        $definition = definition::load('core/wibble', [
+                'mode' => 1,
+                'simplekeys' => true,
+                'simpledata' => true,
+                'component' => 'core',
+                'area' => 'wibble',
+                'selectedsharingoption' => 2,
+                'userinputsharingkey' => '',
+                'sharingoptions' => 15,
+        ]);
+        $this->store = new \cachestore_mbsredis('Test', \cachestore_mbsredis::unit_test_configuration());
+        $this->store->initialise($definition);
+
+        $this->store->set('a', 1);
         $this->store->set('b', 2);
-        $this->store->set_many([['key' => 'c', 'value' => 99], ['key' => 'd', 'value' => 4]]);
 
-        // Check all the data is still set.
-        $this->assertEqualsCanonicalizing(['a', 'b', 'c', 'd', 'e', 'f', 'g', 'h'],
-                $this->store->find_all());
-
-        // Delete some data (to check deletion doesn't confuse expiry).
-        $this->store->delete('f');
-        $this->store->delete_many(['g', 'h']);
-
-        // Set time to 115 and expire data.
-        \cachestore_mbsredis::set_phpunit_time(115);
-        $info = $this->store->expire_ttl();
-
-        // We are expecting keys a and e to be deleted.
-        $this->assertEquals(2, $info['keys']);
-        $this->assertEquals(1, $info['batches']);
-
-        // Check the keys are as expected.
-        $this->assertEqualsCanonicalizing(['b', 'c', 'd'], $this->store->find_all());
-
-        // Might as well check the values of the surviving keys.
-        $this->assertEquals(2, $this->store->get('b'));
-        $this->assertEquals(99, $this->store->get('c'));
-        $this->assertEquals(4, $this->store->get('d'));
+        $this->store->set_many([['key' => 'c', 'value' => 3], ['key' => 'd', 'value' => 4]]);
+        $this->assertTrue($this->store->has('a'));
+        $this->assertTrue($this->store->has('b'));
+        $this->assertTrue($this->store->has('c'));
+        $this->assertTrue($this->store->has('d'));
+        // We did not set any TTL, so let's wait a bit to be sure, but then all the keys should still be there.
+        sleep(2);
+        $this->assertTrue($this->store->has('a'));
+        $this->assertTrue($this->store->has('b'));
+        $this->assertTrue($this->store->has('c'));
+        $this->assertTrue($this->store->has('d'));
     }
 }

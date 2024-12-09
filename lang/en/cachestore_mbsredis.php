@@ -64,7 +64,6 @@ If cluster mode is enabled, specify servers separated by a new line, for example
   172.23.0.13<br>
 
 For further information, see <a href="https://redis.io/docs/reference/clients/#accepting-client-connections">Accepting Client Connections</a> and <a href="https://redis.io/resources/clients/#php">Redis PHP clients</a>.';
-$string['task_ttl'] = 'Free up memory used by expired entries in Redis caches';
 $string['test_clustermode'] = 'Cluster mode';
 $string['test_clustermode_desc'] = 'Enable Test in Redis Cluster mode.';
 $string['test_password'] = 'Test server password';

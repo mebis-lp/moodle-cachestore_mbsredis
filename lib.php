@@ -24,11 +24,7 @@ use core_cache\store;
 /**
  * Redis Cache Store
  *
- * To allow separation of definitions in Moodle and faster purging, each cache
- * is implemented as a Redis hash.  That is a trade-off between having functionality of TTL
- * and being able to manage many caches in a single redis instance.  Given the recommendation
- * not to use TTL if at all possible and the benefits of having many stores in Redis using the
- * hash configuration, the hash implementation has been used.
+ * This is reimplementation of the cachestore_redis plugin. It does NOT use hkeys
  *
  * @package   cachestore_mbsredis
  * @copyright   2024 ISB Bayern
@@ -53,16 +49,6 @@ class cachestore_mbsredis extends store implements
      * Compressor: PHP Zstandard.
      */
     const COMPRESSOR_PHP_ZSTD = 2;
-
-    /**
-     * @var string Suffix used on key name (for hash) to store the TTL sorted list
-     */
-    const TTL_SUFFIX = '_ttl';
-
-    /**
-     * @var int Number of items to delete from cache in one batch when expiring old TTL data.
-     */
-    const TTL_EXPIRE_BATCH = 10000;
 
     /** @var int The number of seconds to wait for a connection or response from the Redis server. */
     const CONNECTION_TIMEOUT = 10;
@@ -175,11 +161,7 @@ class cachestore_mbsredis extends store implements
      * @return int
      */
     public static function get_supported_features(array $configuration = array()) {
-        // Although this plugin now supports TTL I did not add SUPPORTS_NATIVE_TTL here, because
-        // doing so would cause Moodle to stop adding a 'TTL wrapper' to data items which enforces
-        // the precise specified TTL. Unless the scheduled task is set to run rather frequently,
-        // this could cause change in behaviour. Maybe later this should be reconsidered...
-        return self::SUPPORTS_DATA_GUARANTEE + self::DEREFERENCES_OBJECTS + self::IS_SEARCHABLE;
+        return self::SUPPORTS_DATA_GUARANTEE + self::DEREFERENCES_OBJECTS + self::IS_SEARCHABLE + self::SUPPORTS_NATIVE_TTL;
     }
 
     /**
@@ -403,9 +385,7 @@ class cachestore_mbsredis extends store implements
     public function initialise(definition $definition) {
         $this->definition = $definition;
         $this->hash = $definition->generate_definition_hash();
-        // Start the prefix with something different than the hash itself to not mess them up with the ttl hKeys which have
-        // the pattern "$this->hash . self::TTL_SUFFIX". Could be problematic when doing a SCAN for example.
-        $this->prefix = 'cd_' . $this->hash . '_';
+        $this->prefix = $this->hash . '_';
         return true;
     }
 
@@ -500,16 +480,17 @@ class cachestore_mbsredis extends store implements
             $this->lastiobytes = strlen($value);
         }
 
-        if ($this->redis->set($this->prefix . $key, $value) === false) {
-            return false;
+        $ttl = $this->definition->get_ttl();
+        if (empty($ttl)) {
+            if ($this->redis->set($this->prefix . $key, $value) === false) {
+                return false;
+            }
+        } else {
+            if ($this->redis->setex($this->prefix . $key, $ttl, $value) === false) {
+                return false;
+            }
         }
-        if ($this->definition->get_ttl()) {
-            // When TTL is enabled, we also store the key name in a list sorted by the current time.
-            $this->redis->zAdd($this->hash . self::TTL_SUFFIX, [], self::get_time(), $key);
-            // The return value to the zAdd function never indicates whether the operation succeeded
-            // (it returns zero when there was no error if the item is already in the list) so we
-            // ignore it.
-        }
+
         return true;
     }
 
@@ -522,12 +503,7 @@ class cachestore_mbsredis extends store implements
      */
     public function set_many(array $keyvaluearray) {
         $pairs = [];
-        $usettl = false;
-        if ($this->definition->get_ttl()) {
-            $usettl = true;
-            $ttlparams = [];
-            $now = self::get_time();
-        }
+        $ttl = $this->definition->get_ttl();
 
         $this->lastiobytes = 0;
         foreach ($keyvaluearray as $pair) {
@@ -538,23 +514,15 @@ class cachestore_mbsredis extends store implements
             } else {
                 $pairs[$key] = $pair['value'];
             }
-            if ($usettl) {
-                // When TTL is enabled, we also store the key names in a list sorted by the current
-                // time.
-                $ttlparams[] = $now;
-                $ttlparams[] = $pair['key'];
+            if (!empty($ttl)) {
+                $this->redis->setex($key, $ttl, $pairs[$key]);
             }
         }
-        if ($usettl && count($ttlparams) > 0) {
-            // Store all the key values with current time.
-            $this->redis->zAdd($this->hash . self::TTL_SUFFIX, [], ...$ttlparams);
-            // The return value to the zAdd function never indicates whether the operation succeeded
-            // (it returns zero when there was no error if the item is already in the list) so we
-            // ignore it.
-        }
 
-        if ($this->redis->mset($pairs)) {
-            return count($pairs);
+        if (empty($ttl)) {
+            if ($this->redis->mset($pairs)) {
+                return count($pairs);
+            }
         }
         return 0;
     }
@@ -567,12 +535,9 @@ class cachestore_mbsredis extends store implements
      */
     public function delete($key) {
         $ok = true;
+
         if (!$this->redis->unlink($this->prefix . $key)) {
             $ok = false;
-        }
-        if ($this->definition->get_ttl()) {
-            // When TTL is enabled, also remove the key from the TTL list.
-            $this->redis->zRem($this->hash . self::TTL_SUFFIX, $key);
         }
         return $ok;
     }
@@ -589,9 +554,8 @@ class cachestore_mbsredis extends store implements
             return 0;
         }
         $count = $this->redis->unlink(array_map(fn($key) => $this->prefix . $key, $keys));
-        if ($this->definition->get_ttl()) {
-            // When TTL is enabled, also remove the keys from the TTL list.
-            $this->redis->zRem($this->hash . self::TTL_SUFFIX, ...$keys);
+        if ($count === false) {
+            return 0;
         }
         return $count;
     }
@@ -602,13 +566,6 @@ class cachestore_mbsredis extends store implements
      * @return bool
      */
     public function purge() {
-        if ($this->definition->get_ttl()) {
-            // Purge the TTL list as well.
-            $this->redis->unlink($this->hash . self::TTL_SUFFIX);
-            // According to documentation, there is no error return for the 'del' command (it
-            // only returns the number of keys deleted, which could be 0 or 1 in this case) so we
-            // do not need to check the return value.
-        }
         $this->delete_many($this->find_all());
         return true;
     }
@@ -783,74 +740,6 @@ class cachestore_mbsredis extends store implements
             return ($this->redis->unlink($key) !== false);
         }
         return false;
-    }
-
-    /**
-     * Runs TTL expiry process for this cache.
-     *
-     * This is not part of the standard cache API and is intended for use by the scheduled task
-     * \cachestore_mbsredis\ttl.
-     *
-     * @return array Various keys with information about how the expiry went
-     */
-    public function expire_ttl(): array {
-        $ttl = $this->definition->get_ttl();
-        if (!$ttl) {
-            throw new \coding_exception('Cache definition ' . $this->definition->get_id() . ' does not use TTL');
-        }
-        $limit = self::get_time() - $ttl;
-        $count = 0;
-        $batches = 0;
-        $timebefore = microtime(true);
-        $memorybefore = $this->store_total_size();
-        do {
-            $keys = $this->redis->zRangeByScore($this->hash . self::TTL_SUFFIX, 0, $limit,
-                    ['limit' => [0, self::TTL_EXPIRE_BATCH]]);
-            $this->delete_many(array_map(fn($key) => $this->prefix . $key, $keys));
-            $count += count($keys);
-            $batches++;
-        } while (count($keys) === self::TTL_EXPIRE_BATCH);
-        $memoryafter = $this->store_total_size();
-        $timeafter = microtime(true);
-
-        $result = ['keys' => $count, 'batches' => $batches, 'time' => $timeafter - $timebefore];
-        if ($memorybefore !== null) {
-            $result['memory'] = $memorybefore - $memoryafter;
-        }
-        return $result;
-    }
-
-    /**
-     * Gets the current time for TTL functionality. This wrapper makes it easier to unit-test
-     * the TTL behaviour.
-     *
-     * @return int Current time
-     */
-    protected static function get_time(): int {
-        global $CFG;
-        if (PHPUNIT_TEST && !empty($CFG->phpunit_cachestore_mbsredis_time)) {
-            return $CFG->phpunit_cachestore_mbsredis_time;
-        }
-        return time();
-    }
-
-    /**
-     * Sets the current time (within unit test) for TTL functionality.
-     *
-     * This setting is stored in $CFG so will be automatically reset if you use resetAfterTest.
-     *
-     * @param int $time Current time (set 0 to start using real time).
-     */
-    public static function set_phpunit_time(int $time = 0): void {
-        global $CFG;
-        if (!PHPUNIT_TEST) {
-            throw new \coding_exception('Function only available during unit test');
-        }
-        if ($time) {
-            $CFG->phpunit_cachestore_mbsredis_time = $time;
-        } else {
-            unset($CFG->phpunit_cachestore_mbsredis_time);
-        }
     }
 
     /**
